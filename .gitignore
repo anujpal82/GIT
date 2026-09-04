@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+logs/
+.fyers_token.json
+data/
+*.csv
+!tests/**/*.csv
+.pytest_cache/
