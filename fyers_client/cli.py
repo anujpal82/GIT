@@ -1,6 +1,7 @@
 """Command line entry points for the Fyers client.
 
     python -m fyers_client.cli login       # one interactive login
+    python -m fyers_client.cli autologin   # unattended TOTP login, no browser
     python -m fyers_client.cli refresh     # unattended token renewal
     python -m fyers_client.cli status      # what is in the token cache
     python -m fyers_client.cli check       # verify credentials against /profile
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from fyers_client.autologin import AutoLoginError
 from fyers_client.auth import AuthError, FyersAuth
 from fyers_client.config import MissingCredentialsError, load_credentials
 from fyers_client.historical import HistoricalClient, HistoryError
@@ -56,6 +58,22 @@ def cmd_login(args: argparse.Namespace) -> int:
     print("  refresh token expires:", tokens.refresh_expiry)
     print("\nFrom here on, scheduled jobs can renew without a browser:")
     print("  python -m fyers_client.cli refresh")
+    return 0
+
+
+def cmd_autologin(args: argparse.Namespace) -> int:
+    auth = _auth()
+    if not auth.credentials.can_auto_login:
+        print(
+            "error: unattended login needs FYERS_ID, FYERS_PIN and "
+            "FYERS_TOTP_SECRET in .env, alongside the app credentials.",
+            file=sys.stderr,
+        )
+        return 1
+    tokens = auth.auto_login()
+    print("Logged in headlessly; tokens cached at", auth.cache_path)
+    print("  access token expires :", tokens.access_expiry)
+    print("  refresh token expires:", tokens.refresh_expiry)
     return 0
 
 
@@ -130,6 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--auth-code", default="", help="skip the prompt")
     login.set_defaults(func=cmd_login)
 
+    autologin = sub.add_parser(
+        "autologin", help="full unattended login using the TOTP secret"
+    )
+    autologin.set_defaults(func=cmd_autologin)
+
     refresh = sub.add_parser("refresh", help="renew the access token, no browser")
     refresh.set_defaults(func=cmd_refresh)
 
@@ -156,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (AuthError, HistoryError, MissingCredentialsError) as exc:
+    except (AuthError, AutoLoginError, HistoryError, MissingCredentialsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

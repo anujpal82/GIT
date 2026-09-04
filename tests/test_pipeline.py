@@ -21,8 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 
 from fyers_client import auth as auth_mod
-from fyers_client.auth import AuthError, FyersAuth, app_id_hash, jwt_expiry
+from fyers_client.auth import AuthError, FyersAuth, TokenSet, app_id_hash, jwt_expiry
 from fyers_client.config import Credentials
+from fyers_client.totp import generate_totp  # noqa: F401
+
+RFC_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 from fyers_client.historical import (
     HistoricalClient,
     HistoryError,
@@ -222,10 +225,20 @@ class TestRefreshFlow(unittest.TestCase):
         # The renewed token must survive for the next process.
         self.assertEqual(json.loads(self.cache.read_text())["access_token"], fresh)
 
-    def test_expired_refresh_token_asks_for_interactive_login(self):
+    def test_expired_refresh_without_totp_names_both_recovery_paths(self):
         fyers_auth = self._auth_with(make_jwt(-10), make_jwt(-10))
         with self.assertRaises(AuthError) as ctx:
             fyers_auth.access_token("1234")
+        message = str(ctx.exception)
+        self.assertIn("cli login", message)
+        self.assertIn("FYERS_TOTP_SECRET", message)
+
+    def test_refresh_call_rejects_an_expired_refresh_token(self):
+        fyers_auth = self._auth_with(make_jwt(-10), make_jwt(-10))
+        with mock.patch.object(auth_mod.requests, "post") as post:
+            with self.assertRaises(AuthError) as ctx:
+                fyers_auth.refresh("1234")
+        post.assert_not_called()  # never spend a request on a dead token
         self.assertIn("interactive login", str(ctx.exception))
 
     def test_broker_rejection_is_reported(self):
@@ -236,6 +249,35 @@ class TestRefreshFlow(unittest.TestCase):
             with self.assertRaises(AuthError) as ctx:
                 fyers_auth.access_token("0000")
         self.assertIn("bad pin", str(ctx.exception))
+
+    def test_expired_refresh_falls_through_to_auto_login(self):
+        creds = Credentials(
+            "TEST1234-100", "secret", "https://127.0.0.1:8080/",
+            fy_id="XA12345", pin="1234", totp_secret=RFC_SECRET,
+        )
+        self.cache.write_text(
+            json.dumps({"access_token": make_jwt(-10), "refresh_token": make_jwt(-10)})
+        )
+        fyers_auth = FyersAuth(creds, cache_path=self.cache)
+        fresh = make_jwt(3600)
+        with mock.patch.object(FyersAuth, "auto_login") as auto:
+            auto.return_value = TokenSet(access_token=fresh, refresh_token=make_jwt(864000))
+            fyers_auth._tokens.access_token = ""  # force the escalation
+            token = fyers_auth.access_token()
+        auto.assert_called_once()
+        self.assertEqual(token, fresh)
+
+    def test_auto_login_is_skipped_while_cached_token_is_valid(self):
+        creds = Credentials(
+            "TEST1234-100", "secret", "https://127.0.0.1:8080/",
+            fy_id="XA12345", pin="1234", totp_secret=RFC_SECRET,
+        )
+        live = make_jwt(3600)
+        self.cache.write_text(json.dumps({"access_token": live, "refresh_token": ""}))
+        fyers_auth = FyersAuth(creds, cache_path=self.cache)
+        with mock.patch.object(FyersAuth, "auto_login") as auto:
+            self.assertEqual(fyers_auth.access_token(), live)
+        auto.assert_not_called()
 
     def test_login_url_carries_app_and_redirect(self):
         fyers_auth = FyersAuth(self.creds, cache_path=self.cache)

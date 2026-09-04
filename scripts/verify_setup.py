@@ -64,6 +64,31 @@ def check_credentials() -> bool:
     return ok
 
 
+def check_auto_login() -> bool:
+    """Report whether fully unattended login is configured, and prove the TOTP."""
+    from fyers_client.config import load_credentials
+    from fyers_client.totp import TotpError, generate_totp, seconds_remaining
+
+    creds = load_credentials()
+    print("\n-- unattended TOTP login")
+    fields = {"FYERS_ID": creds.fy_id, "FYERS_PIN": creds.pin,
+              "FYERS_TOTP_SECRET": creds.totp_secret}
+    missing = [name for name, value in fields.items() if not value]
+    if missing:
+        print(f"{WARN} not configured -- missing {', '.join(missing)}")
+        print("       (optional: without it, renewal stops when the refresh")
+        print("        token expires and a browser login is needed)")
+        return False
+    try:
+        code = generate_totp(creds.totp_secret)
+    except TotpError as exc:
+        print(f"{BAD} TOTP secret unusable -- {exc}")
+        return False
+    print(f"{OK} all three set; TOTP generates {code[0]}***{code[-1]} "
+          f"({seconds_remaining():.0f}s left in window)")
+    return True
+
+
 def check_tokens() -> None:
     from fyers_client.auth import FyersAuth
     from fyers_client.config import load_credentials
@@ -131,6 +156,7 @@ def main() -> int:
     if not packages:
         return 1
     credentials = check_credentials()
+    auto = check_auto_login()
     check_tokens()
     network = check_network()
     pipeline = check_pandas_pipeline()
@@ -145,8 +171,11 @@ def main() -> int:
         f"{OK if network else WARN} Fyers API "
         f"{'reachable' if network else 'unreachable from here'}"
     )
+    print(f"{OK if auto else WARN} unattended TOTP login "
+          f"{'configured' if auto else 'not configured (optional)'}")
     if credentials and network:
-        print("\nNext: python -m fyers_client.cli login")
+        command = "autologin" if auto else "login"
+        print(f"\nNext: python -m fyers_client.cli {command}")
     return 0 if pipeline else 1
 
 

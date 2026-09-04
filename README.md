@@ -3,35 +3,63 @@
 Connects to [Fyers](https://myapi.fyers.in/) API v3, pulls historical candles,
 and returns them as clean pandas DataFrames.
 
-## Can I log in server-to-server with just client_id + secret?
+## Can I log in server-to-server?
 
-**No — Fyers has no client-credentials grant.** The secret alone cannot mint an
-access token. It is only used to compute `appIdHash = sha256("client_id:secret_key")`,
-which authenticates the *second* leg of the flow. The first leg requires an
-interactive login (Fyers ID, TOTP, PIN) because the token authorises a real
-trading account under SEBI 2FA rules. The official `fyers-apiv3` SDK has no
-refresh or machine-to-machine method either.
+**Not with client_id + secret alone — Fyers has no client-credentials grant.**
+The secret cannot mint a token by itself; it only computes
+`appIdHash = sha256("client_id:secret_key")`, which authenticates the *second*
+leg. The first leg needs a login, because the token authorises a real trading
+account under SEBI 2FA rules. The official `fyers-apiv3` SDK has no refresh or
+machine-to-machine method either.
 
-What you *can* have is **one interactive login, then unattended renewal**:
+What this client does instead is escalate through three paths, cheapest first,
+so a scheduled job never needs a human:
 
 ```
-  browser login ──▶ auth_code ──▶ access_token + refresh_token     (once)
-                                        │
-                                        ▼
-       refresh_token + appIdHash + PIN ──▶ new access_token   (no browser,
-                                                              repeatable)
+  cached access token   ──▶ still valid?           use it
+        │ expired
+        ▼
+  refresh token         ──▶ + appIdHash + PIN      new access token   (~15 days)
+        │ expired
+        ▼
+  TOTP auto-login       ──▶ fy_id + PIN + TOTP     new token pair     (indefinite)
 ```
 
-The refresh token lasts roughly 15 days, so a scheduled job renews itself
-without human involvement until then, at which point one browser login is
-unavoidable. `FyersAuth.access_token()` implements exactly this: it returns the
-cached token while valid, silently refreshes when expired, and only raises when
-a new interactive login is genuinely required. Both tokens are JWTs, so expiry
-is read from the `exp` claim rather than assumed.
+`FyersAuth.access_token()` implements exactly that chain. With the TOTP
+credentials set it is **fully unattended** — no browser, ever, including after
+the refresh token dies. Both tokens are JWTs, so expiry comes from the `exp`
+claim rather than a guessed window.
 
-Some people automate the browser leg by scripting the TOTP login. It works, but
-it is fragile and puts your 2FA seed on the server — check Fyers' terms before
-going that route. This repo does not do it.
+### What TOTP auto-login costs you
+
+Be deliberate about this. The unattended path replays the browser login
+headlessly against Fyers' **internal, undocumented endpoints** — the ones the
+web app calls, not the published API:
+
+| Step | Sends | Gets back |
+| --- | --- | --- |
+| `send_login_otp` | Fyers ID (base64) | `request_key` |
+| `verify_otp` | `request_key` + TOTP | `request_key` |
+| `verify_pin` | `request_key` + PIN (base64) | session token |
+| `token` | session token + app id | redirect URL with `auth_code` |
+
+The `auth_code` is then exchanged through the *documented* `/validate-authcode`,
+the same as the interactive flow.
+
+Two consequences worth accepting on purpose:
+
+- **Your 2FA seed lives on the server.** Anyone with read access to `.env` can
+  mint TOTPs and log in as you, which defeats the point of second-factor auth.
+  Keep the file `0600`, keep it off shared machines, and prefer a secret
+  manager if you have one.
+- **These endpoints carry no compatibility promise** and have moved hosts
+  before. Every URL is overridable via `FYERS_LOGIN_BASE` or the per-step
+  variables in `.env.example`, so a change on Fyers' side is a config edit
+  rather than a code change. Check Fyers' terms before automating the login.
+
+If you would rather not take that on, leave the three TOTP variables unset:
+the client falls back to interactive login plus refresh-token renewal, which
+runs unattended for about 15 days at a stretch.
 
 ## Setup
 
@@ -52,8 +80,9 @@ dashboard character for character, or `/generate-authcode` rejects the request.
 
 ```bash
 python -m fyers_client.cli login      # once: prints the URL, takes the auth_code
+python -m fyers_client.cli autologin  # no browser at all (needs the TOTP vars)
 python -m fyers_client.cli check      # verifies the token against /profile
-python -m fyers_client.cli refresh    # unattended renewal (needs FYERS_PIN)
+python -m fyers_client.cli refresh    # renew from the refresh token
 python -m fyers_client.cli status     # what is in the token cache
 
 python -m fyers_client.cli history \
@@ -66,7 +95,8 @@ From Python:
 ```python
 from fyers_client import FyersAuth, HistoricalClient
 
-client = HistoricalClient(auth=FyersAuth(), pin="1234")
+# With the TOTP variables set, this authenticates itself -- no login step.
+client = HistoricalClient(auth=FyersAuth())
 df = client.fetch("NSE:SBIN-EQ", resolution="5",
                   start="2025-01-01", end="2025-06-30")
 
@@ -103,23 +133,36 @@ one call in your code.
 python -m unittest discover -s tests -v
 ```
 
-20 tests, no network and no credentials required: every Fyers HTTP call is
+45 tests, no network and no credentials required: every Fyers HTTP call is
 replaced with a fake of the documented response shape. They cover the appIdHash
-formula, JWT expiry parsing, the refresh lifecycle (reuse / renew / expired /
-broker rejection), chunk contiguity, and the DataFrame contract above.
+formula, JWT expiry parsing, the full token escalation (cached / refresh /
+auto-login / exhausted), the four login steps and their per-step failures,
+chunk contiguity, and the DataFrame contract above.
+
+The TOTP generator is checked against the **RFC 6238 Appendix B test vectors**,
+so a bad code is ruled out as a cause before you go debugging an opaque
+"invalid OTP" from the broker.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
 | `fyers_client/config.py` | credential loading, resolution limits |
-| `fyers_client/auth.py` | login URL, token exchange, unattended refresh, cache |
+| `fyers_client/auth.py` | login URL, token exchange, refresh, escalation, cache |
+| `fyers_client/totp.py` | RFC 6238 TOTP, standard library only |
+| `fyers_client/autologin.py` | headless four-step login (undocumented endpoints) |
 | `fyers_client/historical.py` | chunked fetch, retries, pandas conversion |
 | `fyers_client/cli.py` | `login` / `refresh` / `status` / `check` / `history` |
 | `scripts/verify_setup.py` | environment and connectivity diagnostic |
-| `tests/test_pipeline.py` | offline test suite |
+| `tests/test_pipeline.py` | auth lifecycle, chunking, DataFrame contract |
+| `tests/test_totp.py` | RFC 6238 vectors |
+| `tests/test_autologin.py` | the four login steps and their failure modes |
 
 ## Security
 
 `.env` and `.fyers_token.json` are gitignored, and the token cache is written
-`0600`. Never commit either — an access token is a live trading credential.
+`0600`. Never commit either — an access token is a live trading credential, and
+with TOTP configured `.env` additionally holds your 2FA seed, PIN and Fyers ID.
+That one file is enough to take over the account, so treat it accordingly:
+restrict its permissions, keep it off shared boxes and out of backups, and move
+it into a secret manager if you have one.

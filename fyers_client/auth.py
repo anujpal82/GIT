@@ -27,13 +27,13 @@ from typing import Any
 import requests
 
 from fyers_client.config import (
+    API_BASE,
     TOKEN_CACHE_PATH,
     Credentials,
     MissingCredentialsError,
     load_credentials,
 )
 
-API_BASE = "https://api-t1.fyers.in/api/v3"
 AUTHCODE_URL = f"{API_BASE}/generate-authcode"
 VALIDATE_AUTHCODE_URL = f"{API_BASE}/validate-authcode"
 VALIDATE_REFRESH_URL = f"{API_BASE}/validate-refresh-token"
@@ -213,19 +213,48 @@ class FyersAuth:
 
     # -------------------------------------------------------------- public
 
-    def access_token(self, pin: str = "", allow_refresh: bool = True) -> str:
-        """Return a usable access token, refreshing it when possible.
+    def auto_login(self) -> TokenSet:
+        """Log in headlessly with the TOTP secret and cache the tokens.
+
+        Requires FYERS_ID, FYERS_PIN and FYERS_TOTP_SECRET. This is what makes
+        the client survive refresh-token expiry without a human.
+        """
+        from fyers_client.autologin import AutoLogin
+
+        return self.exchange_auth_code(AutoLogin(self.credentials).auth_code())
+
+    def access_token(
+        self, pin: str = "", allow_refresh: bool = True, allow_auto_login: bool = True
+    ) -> str:
+        """Return a usable access token, renewing it however it can.
 
         Call this at the top of every scheduled job; it is a no-op while the
-        cached token is still valid.
+        cached token is still valid. The escalation order is deliberate --
+        cheapest and least credential-exposing first:
+
+            cached token -> refresh token -> full TOTP login
         """
         if _is_live(self._tokens.access_token):
             return self._tokens.access_token
-        if allow_refresh and self._tokens.refresh_token:
-            return self.refresh(pin).access_token
+
+        pin = pin or self.credentials.pin
+        if allow_refresh and self._tokens.refresh_token and _is_live(
+            self._tokens.refresh_token
+        ):
+            try:
+                return self.refresh(pin).access_token
+            except AuthError:
+                if not (allow_auto_login and self.credentials.can_auto_login):
+                    raise
+                # Refresh can fail for reasons a fresh login fixes; fall through.
+
+        if allow_auto_login and self.credentials.can_auto_login:
+            return self.auto_login().access_token
+
         raise AuthError(
-            "No valid access token available. Run "
-            "`python -m fyers_client.cli login` to authenticate."
+            "No valid access token available. Either run "
+            "`python -m fyers_client.cli login` once, or set FYERS_ID, "
+            "FYERS_PIN and FYERS_TOTP_SECRET for unattended login."
         )
 
     def status(self) -> dict[str, Any]:
